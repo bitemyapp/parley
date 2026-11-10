@@ -17,14 +17,77 @@ use super::{
 
 #[derive(Clone, Default)]
 pub(super) struct QueryState {
-    families: Vec<CachedFamily>,
+    families: FamilyList,
     fallback_families: Vec<CachedFamily>,
 }
 
 impl QueryState {
     fn clear(&mut self) {
-        self.families.clear();
+        self.families.truncate(0);
         self.fallback_families.clear();
+    }
+}
+
+/// The families a query matches against first, and what it has found out
+/// about the ones it has reached.
+///
+/// The list can stand for hundreds of families: a generic family is as
+/// long as the system makes it, and fontconfig's `sans-serif` and `emoji`
+/// commonly run past a hundred. Matching rarely goes beyond the first few,
+/// so a family costs nothing until matching reaches it: a generic family
+/// is expanded then, and a family gets its cache entry when it is first
+/// looked at.
+#[derive(Clone, Default)]
+struct FamilyList {
+    /// The list as it was set, with family names resolved.
+    sources: Vec<Source>,
+    /// Where the families of each expanded source end in `ids`. Sources
+    /// are expanded in order, so these are the first `ends.len()` of them.
+    ends: Vec<usize>,
+    /// The families of the expanded sources, in order.
+    ids: Vec<FamilyId>,
+    /// Cache entries for the first `cached.len()` families of `ids`.
+    cached: Vec<CachedFamily>,
+}
+
+/// An entry of the list given to [`Query::set_families`].
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum Source {
+    Family(FamilyId),
+    Generic(GenericFamily),
+}
+
+impl FamilyList {
+    /// Shortens the list to its first `len` sources, keeping everything
+    /// known about their families.
+    fn truncate(&mut self, len: usize) {
+        self.sources.truncate(len);
+        if self.ends.len() > len {
+            self.ends.truncate(len);
+            let ids = self.ends.last().copied().unwrap_or(0);
+            self.ids.truncate(ids);
+            self.cached.truncate(ids);
+        }
+    }
+
+    /// Returns the cache entry for the family at `index` of the expanded
+    /// list, expanding sources as far as that takes, or `None` past the
+    /// end of the list.
+    ///
+    /// Matching asks for each index in turn, starting from zero.
+    fn family(&mut self, index: usize, collection: &mut Inner) -> Option<&mut CachedFamily> {
+        while index >= self.ids.len() {
+            match *self.sources.get(self.ends.len())? {
+                Source::Family(id) => self.ids.push(id),
+                Source::Generic(generic) => self.ids.extend(collection.generic_families(generic)),
+            }
+            self.ends.push(self.ids.len());
+        }
+        while self.cached.len() <= index {
+            self.cached
+                .push(CachedFamily::new(self.ids[self.cached.len()]));
+        }
+        self.cached.get_mut(index)
     }
 }
 
@@ -57,31 +120,38 @@ impl<'a> Query<'a> {
         I: IntoIterator,
         I::Item: Into<QueryFamily<'f>>,
     {
-        self.state.families.clear();
+        // The new list often starts as the old one did: the same families
+        // with another after them, or without it. What the query has found
+        // out about those families still holds, so only the part of the
+        // list that differs is replaced.
+        let list = &mut self.state.families;
+        let mut len = 0;
+        let mut same = true;
         for family in families {
-            let family = family.into();
-            match family {
-                QueryFamily::Named(name) => {
-                    if let Some(id) = self.collection.family_id(name) {
-                        self.state.families.push(CachedFamily::new(id));
-                    }
-                }
-                QueryFamily::Id(id) => {
-                    self.state.families.push(CachedFamily::new(id));
-                }
-                QueryFamily::Generic(generic) => {
-                    for id in self.collection.generic_families(generic) {
-                        self.state.families.push(CachedFamily::new(id));
-                    }
-                }
+            let source = match family.into() {
+                QueryFamily::Named(name) => match self.collection.family_id(name) {
+                    Some(id) => Source::Family(id),
+                    None => continue,
+                },
+                QueryFamily::Id(id) => Source::Family(id),
+                QueryFamily::Generic(generic) => Source::Generic(generic),
+            };
+            if same && list.sources.get(len) != Some(&source) {
+                list.truncate(len);
+                same = false;
             }
+            if !same {
+                list.sources.push(source);
+            }
+            len += 1;
         }
+        list.truncate(len);
     }
 
     /// Sets the primary attributes to match against.
     pub fn set_attributes(&mut self, attributes: Attributes) {
         if self.attributes != attributes {
-            for family in &mut self.state.families {
+            for family in &mut self.state.families.cached {
                 family.clear_fonts();
             }
             for family in &mut self.state.fallback_families {
@@ -119,12 +189,21 @@ impl<'a> Query<'a> {
     /// Return [`QueryStatus::Stop`] to end iterating over the matching
     /// fonts or [`QueryStatus::Continue`] to continue iterating.
     pub fn matches_with(&mut self, mut f: impl FnMut(&QueryFont) -> QueryStatus) {
-        for family in self
-            .state
-            .families
-            .iter_mut()
-            .chain(self.state.fallback_families.iter_mut())
-        {
+        let mut index = 0;
+        loop {
+            // The families that were set, then the fallback families.
+            let families = &mut self.state.families;
+            let family = match families.family(index, self.collection) {
+                Some(family) => family,
+                None => {
+                    let fallback = index - families.ids.len();
+                    match self.state.fallback_families.get_mut(fallback) {
+                        Some(family) => family,
+                        None => return,
+                    }
+                }
+            };
+            index += 1;
             match &mut family.family {
                 Entry::Error => continue,
                 Entry::Ok(..) => {}
