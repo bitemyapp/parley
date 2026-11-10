@@ -526,7 +526,12 @@ fn variations_iter<'a>(
 
 struct FontSelector<'a, 'b, B: Brush> {
     query: &'b mut Query<'a>,
+    /// The font stack the query has for its families, if it has just a
+    /// stack.
     fonts_id: Option<usize>,
+    /// The font stack the query has for its families with the emoji
+    /// families after it, if it has that.
+    emoji_fonts_id: Option<usize>,
     rcx: &'a ResolveContext,
     styles: &'a [ResolvedStyle<B>],
     style_index: u16,
@@ -562,6 +567,7 @@ impl<'a, 'b, B: Brush> FontSelector<'a, 'b, B> {
         Self {
             query,
             fonts_id: Some(fonts_id),
+            emoji_fonts_id: None,
             rcx,
             styles,
             style_index,
@@ -582,19 +588,8 @@ impl<'a, 'b, B: Brush> FontSelector<'a, 'b, B> {
             self.style_index = style_index;
             let style = &self.styles[style_index as usize];
 
-            let fonts_id = style.font_family.id();
-            let fonts = self.rcx.stack(style.font_family).unwrap_or(&[]);
-            let fonts = fonts.iter().copied().map(QueryFamily::Id);
-            if is_emoji {
-                use core::iter::once;
-                let emoji_family = QueryFamily::Generic(fontique::GenericFamily::Emoji);
-                self.query.set_families(fonts.chain(once(emoji_family)));
-                self.fonts_id = None;
-            } else if self.fonts_id != Some(fonts_id) {
-                self.query.set_families(fonts);
-                self.fonts_id = Some(fonts_id);
-            }
-
+            // The attributes come first: an emoji cluster may ask the query
+            // for a font below.
             let attrs = fontique::Attributes {
                 width: style.font_width,
                 weight: style.font_weight,
@@ -606,29 +601,42 @@ impl<'a, 'b, B: Brush> FontSelector<'a, 'b, B> {
             }
             self.variations = self.rcx.variations(style.font_variations).unwrap_or(&[]);
             self.features = self.rcx.features(style.font_features).unwrap_or(&[]);
+
+            let fonts_id = style.font_family.id();
+            let stack = self.rcx.stack(style.font_family).unwrap_or(&[]);
+            let fonts = stack.iter().copied().map(QueryFamily::Id);
+            if !is_emoji {
+                if self.fonts_id != Some(fonts_id) {
+                    self.query.set_families(fonts);
+                    self.fonts_id = Some(fonts_id);
+                    self.emoji_fonts_id = None;
+                }
+            } else if self.emoji_fonts_id != Some(fonts_id) {
+                // The emoji families go after the stack, so they only matter
+                // when the stack's fonts leave some of the cluster uncovered.
+                // Its first font rarely does for the digits, `#` and `*`,
+                // which have the Emoji property for the keycap sequences
+                // they start. So while the query has just the stack, that
+                // font gets the first try, and the query stays as it is
+                // when the font takes the cluster.
+                if self.fonts_id == Some(fonts_id) {
+                    let font = self.select_first_if_complete(cluster, stack, analysis_data_sources);
+                    if font.is_some() {
+                        return font;
+                    }
+                }
+                use core::iter::once;
+                let emoji_family = QueryFamily::Generic(fontique::GenericFamily::Emoji);
+                self.query.set_families(fonts.chain(once(emoji_family)));
+                self.fonts_id = None;
+                self.emoji_fonts_id = Some(fonts_id);
+            }
         }
         let mut selected_font = None;
         self.query.matches_with(|font| {
-            let Some(charmap) = font.charmap() else {
+            let Some(map_status) = map_cluster(cluster, font, analysis_data_sources) else {
                 return fontique::QueryStatus::Continue;
             };
-
-            let map_status = cluster.map(
-                |ch| {
-                    charmap
-                        .map(ch)
-                        .map(|g| {
-                            // HACK: in reality, we're only computing coverage, so
-                            // we only care about whether the font  has a mapping
-                            // for a particular glyph. Any non-zero value indicates
-                            // the existence of a glyph so we can simplify this
-                            // without a fallible conversion from u32 to u16.
-                            (g != 0) as u16
-                        })
-                        .unwrap_or_default()
-                },
-                analysis_data_sources,
-            );
 
             match map_status {
                 Status::Complete => {
@@ -658,6 +666,64 @@ impl<'a, 'b, B: Brush> FontSelector<'a, 'b, B> {
         });
         selected_font
     }
+
+    /// Selects the first font the query yields for `cluster` if that font is
+    /// from one of `stack`'s families and has all of the cluster. Otherwise
+    /// the cluster is left as it was before.
+    ///
+    /// That is the font [`select_font`](Self::select_font) selects whatever
+    /// families follow the stack in the query: the query yields it first
+    /// either way, and matching stops at a font with all of a cluster.
+    fn select_first_if_complete(
+        &mut self,
+        cluster: &mut CharCluster,
+        stack: &[fontique::FamilyId],
+        analysis_data_sources: &AnalysisDataSources,
+    ) -> Option<SelectedFont> {
+        let mut selected_font = None;
+        self.query.matches_with(|font| {
+            if stack.contains(&font.family.0)
+                && map_cluster(cluster, font, analysis_data_sources) == Some(Status::Complete)
+            {
+                selected_font = Some(SelectedFont {
+                    font: font.clone(),
+                    attrs: self.attrs,
+                });
+            }
+            fontique::QueryStatus::Stop
+        });
+        if selected_font.is_none() {
+            cluster.clear_mapping();
+        }
+        selected_font
+    }
+}
+
+/// Maps `cluster` to `font`'s glyphs, returning how its coverage compares
+/// with that of the fonts tried before it, or `None` if the font has no
+/// character map.
+fn map_cluster(
+    cluster: &mut CharCluster,
+    font: &QueryFont,
+    analysis_data_sources: &AnalysisDataSources,
+) -> Option<Status> {
+    let charmap = font.charmap()?;
+    Some(cluster.map(
+        |ch| {
+            charmap
+                .map(ch)
+                .map(|g| {
+                    // HACK: in reality, we're only computing coverage, so
+                    // we only care about whether the font  has a mapping
+                    // for a particular glyph. Any non-zero value indicates
+                    // the existence of a glyph so we can simplify this
+                    // without a fallible conversion from u32 to u16.
+                    (g != 0) as u16
+                })
+                .unwrap_or_default()
+        },
+        analysis_data_sources,
+    ))
 }
 
 struct SelectedFont {

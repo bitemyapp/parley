@@ -104,6 +104,18 @@ impl CharCluster {
         self.best_ratio = 0.;
     }
 
+    /// Forgets everything [`map`](Self::map) has found out, leaving the
+    /// cluster as it was before any font was tried.
+    pub(crate) fn clear_mapping(&mut self) {
+        for ch in &mut self.chars {
+            ch.glyph_id = 0;
+        }
+        self.comp.clear();
+        self.decomp.clear();
+        self.form = FormKind::Original;
+        self.best_ratio = 0.;
+    }
+
     #[inline(always)]
     fn len(&self) -> usize {
         self.chars.len()
